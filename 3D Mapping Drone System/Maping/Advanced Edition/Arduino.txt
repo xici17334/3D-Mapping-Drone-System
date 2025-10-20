@@ -1,0 +1,307 @@
+/*
+ * Author: Yin Sizhe & Chi Hengcheng
+ * File: ESP32_LiDAR_ToF_UDP.ino
+ * Description:
+ *   ESP32 + YDLIDAR T-mini Plus (UART) + VL53L0X (I2C)
+ *   - SoftAP: SSID=UAV-ESP32, PASS=uav12345  (default 192.168.4.1/24)
+ *   - LiDAR: CSV text (Frame Header F / Point P) -> UDP 9000
+ *   - ToF  : JSON -> UDP 4210,  ALT:xx.xxx -> UDP 8888
+ *   - Angle conversion: angle_deg = (raw >> 1) / 64.0f (official formula)
+ *   - Optimization: one packet per frame to reduce UDP jitter and packet loss
+ *
+ * Hardware wiring:
+ *   UART2: ESP32 RX2=GPIO16 ← LiDAR TX,  ESP32 TX2=GPIO17 → LiDAR RX
+ *   I2C  : SDA=21, SCL=22, recommended 4.7k~10k pull-ups to 3V3
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+
+/************** Hardware Pins & Serial Ports **************/
+#define RXD2            16    // LiDAR UART RX (ESP32 RX2 connected to LiDAR TX)
+#define TXD2            17    // LiDAR UART TX (ESP32 TX2 connected to LiDAR RX)
+#define LIDAR_BAUD      230400 // Use 115200 if you get garbled or no data
+#define I2C_SDA         21
+#define I2C_SCL         22
+#define I2C_FREQ        400000 // Set to 100000 if unstable
+
+/************** LiDAR Protocol Constants **************/
+#define HDR_L           0xAA
+#define HDR_H           0x55
+#define MAX_POINTS_PER_FRAME 1536  // Expanded to prevent frame loss
+const uint8_t CMD_START[2] = {0xA5, 0x60};
+const uint8_t CMD_STOP [2] = {0xA5, 0x65};
+
+/************** Wi-Fi / UDP Configuration **************/
+const char* AP_SSID = "UAV-ESP32";   // Keep same as comment for easy debugging
+const char* AP_PASS = "uav12345";
+const uint8_t AP_CHANNEL = 6;         // Try 1 or 11 if channel is congested
+WiFiUDP udp;
+const uint16_t LIDAR_PORT    = 9000;
+const uint16_t TOF_JSON_PORT = 4210;
+const uint16_t TOF_ALT_PORT  = 8888;
+
+// Broadcast address (ESP32 SoftAP default 192.168.4.1/24)
+IPAddress BROADCAST_IP(192,168,4,255);
+
+// For unicast to PC, set true and specify PC IP; otherwise broadcast
+IPAddress PC_IP(192,168,4,2);
+const bool USE_UNICAST_TO_PC_LIDAR = false;
+const bool USE_UNICAST_TO_PC_TOF   = false;
+
+/************** LiDAR Parsing State Machine **************/
+enum ParseState {
+  SYNC_HDR1, SYNC_HDR2, READ_CT, READ_LSN, READ_FSA0, READ_FSA1,
+  READ_LSA0, READ_LSA1, READ_CS0, READ_CS1, READ_SAMPLES
+};
+ParseState st = SYNC_HDR1;
+
+uint8_t  ct = 0;
+uint8_t  lsn = 0;
+uint16_t fsa = 0, lsa = 0;   // Raw angle words
+uint16_t cs  = 0;            // Checksum (optional)
+uint8_t  sampleBuf[MAX_POINTS_PER_FRAME * 3];
+uint16_t sampleIdx = 0;
+uint32_t frame_seq = 0;
+
+/************** VL53L0X (Simplified Direct I2C Read) **************/
+#define VL53_ADDR 0x29
+#define REG_ID_MODEL          0xC0
+#define REG_ID_REV            0xC2
+#define REG_SYSRANGE_START    0x00
+#define REG_RESULT_INT_STATUS 0x13
+#define REG_RESULT_RANGE_STAT 0x14
+
+uint8_t gbuf[16];
+unsigned long tof_period_ms = 200;   // ToF frequency = 5 Hz
+unsigned long last_tof_ms = 0;
+
+bool i2cWriteByteAt(uint8_t reg, uint8_t data) {
+  Wire.beginTransmission(VL53_ADDR);
+  Wire.write(reg);
+  Wire.write(data);
+  return Wire.endTransmission() == 0;
+}
+bool i2cWriteReg(uint8_t reg) {
+  Wire.beginTransmission(VL53_ADDR);
+  Wire.write(reg);
+  return Wire.endTransmission(false) == 0;
+}
+bool i2cReadN(uint8_t reg, uint8_t *buf, size_t n) {
+  if (!i2cWriteReg(reg)) return false;
+  Wire.requestFrom((int)VL53_ADDR, (int)n);
+  unsigned long t0 = millis();
+  size_t i = 0;
+  while (i < n) {
+    if (Wire.available()) buf[i++] = Wire.read();
+    else { if (millis() - t0 > 200) return false; delay(1); }
+  }
+  return true;
+}
+static inline uint16_t makeuint16(int lsb, int msb){ return ((msb & 0xFF) << 8) | (lsb & 0xFF); }
+
+bool vl53_check_id() {
+  uint8_t model=0, rev=0;
+  if (!i2cReadN(REG_ID_MODEL, &model, 1)) return false;
+  if (!i2cReadN(REG_ID_REV, &rev, 1))     return false;
+  Serial.printf("VL53 ID=0x%02X REV=0x%02X\n", model, rev);
+  return true;
+}
+
+bool vl53_single_measure(uint16_t &distance_mm, uint16_t &ambient, uint16_t &signal, uint8_t &status) {
+  if (!i2cWriteByteAt(REG_SYSRANGE_START, 0x01)) return false; // Single-shot mode
+  unsigned long t0 = millis();
+  while (millis() - t0 < 1000) {           // Wait for ready
+    uint8_t val=0;
+    if (!i2cReadN(REG_RESULT_RANGE_STAT, &val, 1)) return false;
+    if (val & 0x01) break;
+    delay(5);
+  }
+  if (millis() - t0 >= 1000) return false;
+
+  if (!i2cReadN(REG_RESULT_RANGE_STAT, gbuf, 12)) return false;
+  ambient     = makeuint16(gbuf[7],  gbuf[6]);
+  signal      = makeuint16(gbuf[9],  gbuf[8]);
+  distance_mm = makeuint16(gbuf[11], gbuf[10]);
+  status      = (gbuf[0] & 0x78) >> 3;
+
+  if (distance_mm == 0 || distance_mm > 4000) return false; // Simple validity filter
+  return true;
+}
+
+/************** UDP Transmission Helpers **************/
+static inline uint16_t u16le(uint8_t lo, uint8_t hi) { return (uint16_t)lo | ((uint16_t)hi << 8); }
+
+// One frame per UDP packet
+static char  pktbuf[8192];
+static size_t pktlen = 0;
+static inline void pkt_reset() { pktlen = 0; }
+static inline void pkt_append(const char* s) {
+  size_t l = strlen(s);
+  if (pktlen + l < sizeof(pktbuf)) { memcpy(pktbuf + pktlen, s, l); pktlen += l; }
+}
+static inline void pkt_flush(bool to_pc, uint16_t port) {
+  if (pktlen == 0) return;
+  if (to_pc) {
+    udp.beginPacket(PC_IP, port);
+  } else {
+    udp.beginPacket(BROADCAST_IP, port);
+  }
+  udp.write((const uint8_t*)pktbuf, pktlen);
+  udp.endPacket();
+  pktlen = 0;
+}
+
+// ToF JSON & ALT (choose between unicast and broadcast)
+void send_tof_json(unsigned long t_ms, uint16_t d_mm, uint16_t amb, uint16_t sig, uint8_t st) {
+  char jbuf[128];
+  int n = snprintf(jbuf, sizeof(jbuf),
+                   "{\"t\":%lu,\"d_mm\":%u,\"ambient\":%u,\"signal\":%u,\"status\":%u}",
+                   t_ms, d_mm, amb, sig, st);
+  if (n <= 0) return;
+  if (USE_UNICAST_TO_PC_TOF) {
+    udp.beginPacket(PC_IP, TOF_JSON_PORT);
+  } else {
+    udp.beginPacket(BROADCAST_IP, TOF_JSON_PORT);
+  }
+  udp.write((const uint8_t*)jbuf, n);
+  udp.endPacket();
+}
+
+void send_tof_alt(float meter) {
+  char abuf[32];
+  int n = snprintf(abuf, sizeof(abuf), "ALT:%.3f\n", meter);
+  if (n <= 0) return;
+  if (USE_UNICAST_TO_PC_TOF) {
+    udp.beginPacket(PC_IP, TOF_ALT_PORT);
+  } else {
+    udp.beginPacket(BROADCAST_IP, TOF_ALT_PORT);
+  }
+  udp.write((const uint8_t*)abuf, n);
+  udp.endPacket();
+}
+
+/************** Log (One Line Per Frame) **************/
+void log_lidar_frame(uint8_t lsn, float fsa_deg, float lsa_deg) {
+  Serial.printf("[LIDAR] seq=%lu lsn=%u fsa=%.2f lsa=%.2f\n",
+                (unsigned long)frame_seq, lsn, fsa_deg, lsa_deg);
+}
+
+/************** Wi-Fi Initialization **************/
+void wifi_init_ap_udp() {
+  WiFi.mode(WIFI_AP);
+  bool ok = WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, /*hidden=*/0, /*maxconn=*/4, /*beacon=*/false);
+  delay(200);
+  udp.begin(LIDAR_PORT); // Bind one port for all UDP operations
+  Serial.printf("[AP] %s  IP=%s\n", ok ? "OK" : "FAIL", WiFi.softAPIP().toString().c_str());
+  Serial.printf("[UDP] LIDAR:%u  TOF_JSON:%u  TOF_ALT:%u  (broadcast %s)\n",
+                LIDAR_PORT, TOF_JSON_PORT, TOF_ALT_PORT, BROADCAST_IP.toString().c_str());
+}
+
+/************** Arduino Main **************/
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(I2C_SDA, I2C_SCL, I2C_FREQ);
+
+  wifi_init_ap_udp();
+
+  // VL53L0X ID check (only for existence; replace with library for robustness)
+  if (!vl53_check_id()) Serial.println("VL53L0X ID read failed (check wiring/pullups).");
+
+  // LiDAR serial setup & start scanning
+  Serial2.begin(LIDAR_BAUD, SERIAL_8N1, RXD2, TXD2);
+  delay(100);
+  Serial2.write(CMD_START, sizeof(CMD_START));
+  Serial.println("T-mini Plus start-scan (A5 60) sent.");
+}
+
+void loop() {
+  /******** LiDAR Parsing (read as much as possible) ********/
+  while (Serial2.available()) {
+    uint8_t b = Serial2.read();
+
+    switch (st) {
+      case SYNC_HDR1: if (b == HDR_L) st = SYNC_HDR2; break;
+      case SYNC_HDR2: st = (b == HDR_H) ? READ_CT : SYNC_HDR1; break;
+      case READ_CT:   ct = b; st = READ_LSN; break;
+
+      case READ_LSN:
+        lsn = b;
+        if (lsn == 0 || lsn > MAX_POINTS_PER_FRAME) { st = SYNC_HDR1; break; }
+        st = READ_FSA0; break;
+
+      case READ_FSA0: fsa = b; st = READ_FSA1; break;
+      case READ_FSA1: fsa |= ((uint16_t)b << 8); st = READ_LSA0; break;
+      case READ_LSA0: lsa = b; st = READ_LSA1; break;
+      case READ_LSA1: lsa |= ((uint16_t)b << 8); st = READ_CS0; break;
+      case READ_CS0:  cs  = b; st = READ_CS1; break;
+      case READ_CS1:  cs |= ((uint16_t)b << 8); sampleIdx = 0; st = READ_SAMPLES; break;
+
+      case READ_SAMPLES: {
+        sampleBuf[sampleIdx++] = b;
+        if (sampleIdx >= (uint16_t)lsn * 3) {
+          // — Frame complete —
+          float fsa_deg = ((float)(fsa >> 1)) / 64.0f;
+          float lsa_deg = ((float)(lsa >> 1)) / 64.0f;
+
+          float span = lsa_deg - fsa_deg;
+          if (span < -180.0f) span += 360.0f;
+          else if (span > 180.0f) span -= 360.0f;
+
+          // Construct one UDP packet per frame
+          pkt_reset();
+          {
+            char line[80];
+            int n = snprintf(line, sizeof(line), "F,%lu,%u,%.2f,%.2f\n",
+                             (unsigned long)frame_seq, (unsigned)lsn, fsa_deg, lsa_deg);
+            if (n > 0) pkt_append(line);
+          }
+
+          for (uint16_t i = 0; i < lsn; ++i) {
+            uint8_t  intensity = sampleBuf[i * 3 + 0];
+            uint16_t dist_mm   = u16le(sampleBuf[i * 3 + 1], sampleBuf[i * 3 + 2]);
+            if (dist_mm == 0 || dist_mm == 0xFFFF) continue;
+
+            float angle_deg = fsa_deg + (lsn > 1 ? (span * i) / (lsn - 1) : 0.0f);
+            if (angle_deg < 0) angle_deg += 360.0f;
+            else if (angle_deg >= 360.0f) angle_deg -= 360.0f;
+
+            char line[64];
+            int n = snprintf(line, sizeof(line), "P,%u,%.2f,%u,%u\n",
+                             (unsigned)i, angle_deg, (unsigned)dist_mm, (unsigned)intensity);
+            if (n > 0) pkt_append(line);
+          }
+
+          // Send packet (unicast or broadcast)
+          pkt_flush(USE_UNICAST_TO_PC_LIDAR, LIDAR_PORT);
+
+          log_lidar_frame(lsn, fsa_deg, lsa_deg);
+          frame_seq++;
+          st = SYNC_HDR1; // Next frame
+        }
+        break;
+      }
+      default: st = SYNC_HDR1; break;
+    }
+  }
+
+  /******** ToF Sampling (5Hz, non-blocking to LiDAR) ********/
+  unsigned long now = millis();
+  if (now - last_tof_ms >= tof_period_ms) {
+    last_tof_ms = now;
+
+    uint16_t d_mm=0, amb=0, sig=0; uint8_t stt=0;
+    if (vl53_single_measure(d_mm, amb, sig, stt)) {
+      float d_m = d_mm / 1000.0f;
+      send_tof_json(now, d_mm, amb, sig, stt);
+      send_tof_alt(d_m);
+      Serial.printf("[TOF ] t=%lu d=%.3fm (mm=%u) st=%u\n", now, d_m, d_mm, stt);
+    } else {
+      // Suppress repetitive failure prints; show occasionally
+      static uint32_t fail_cnt=0; fail_cnt++;
+      if ((fail_cnt & 0x1F) == 0) Serial.println("[TOF ] measure failed/timeout (mute: some dropped)");
+    }
+  }
+}
